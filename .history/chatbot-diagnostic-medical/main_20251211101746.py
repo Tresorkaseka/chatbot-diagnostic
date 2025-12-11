@@ -2,7 +2,7 @@
 API Backend: Chatbot Diagnostic Médical
 Framework: FastAPI
 Modèle: Random Forest (49 maladies DDXPlus, 110 symptômes)
-100% en Français - Version Windows avec Mock XGBoost Avancé + LOGIQUE DYNAMIQUE
+100% en Français - Version Windows avec Mock XGBoost Avancé
 """
 
 import os
@@ -21,21 +21,28 @@ import types
 try:
     import xgboost
 except ImportError:
+    # Créer module xgboost
     xgb_module = types.ModuleType('xgboost')
     sys.modules['xgboost'] = xgb_module
+    
+    # Créer module xgboost.core
     xgb_core = types.ModuleType('xgboost.core')
     sys.modules['xgboost.core'] = xgb_core
     xgb_module.core = xgb_core
+    
+    # Créer module xgboost.sklearn
     xgb_sklearn = types.ModuleType('xgboost.sklearn')
     sys.modules['xgboost.sklearn'] = xgb_sklearn
     xgb_module.sklearn = xgb_sklearn
     
+    # Classes factices
     class MockXGB:
         def __init__(self, *args, **kwargs): pass
         def fit(self, *args, **kwargs): return self
         def predict(self, *args, **kwargs): return []
         def predict_proba(self, *args, **kwargs): return []
     
+    # Injecter les classes
     xgb_module.XGBClassifier = MockXGB
     xgb_module.XGBRegressor = MockXGB
     xgb_sklearn.XGBClassifier = MockXGB
@@ -60,6 +67,7 @@ API_PORT = int(os.getenv("API_PORT", 8000))
 MODEL_PATH = os.getenv("MODEL_PATH", "./ddxplus_final.pkl")
 DEBUG = os.getenv("DEBUG", "True").lower() == "true"
 
+# Créer dossier logs
 os.makedirs("./logs", exist_ok=True)
 
 # ========== LOGGING ==========
@@ -104,7 +112,7 @@ print("="*70 + "\n")
 app = FastAPI(
     title="Chatbot Diagnostic Médical DDXPlus",
     description=f"API diagnostic basée sur IA - {len(pathologies)} maladies, {len(symptom_list)} symptômes",
-    version="3.1.0",
+    version="3.0.0",
     docs_url="/docs" if DEBUG else None,
     redoc_url="/redoc" if DEBUG else None
 )
@@ -117,7 +125,6 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# --- MODÈLES Pydantic ---
 class RequeteDiagnostic(BaseModel):
     symptomes: Dict[str, int] = Field(..., description="Dictionnaire symptômes {code: 0|1}")
     session_id: Optional[str] = Field(None, description="ID session utilisateur")
@@ -125,7 +132,11 @@ class RequeteDiagnostic(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "symptomes": {"E_48": 1, "E_50": 1},
+                "symptomes": {
+                    "E_48": 1,
+                    "E_50": 1,
+                    "E_53": 1
+                },
                 "session_id": "test-session-123"
             }
         }
@@ -162,14 +173,6 @@ class StatusAPI(BaseModel):
     version: str
     environment: str
 
-class NextQuestionResponse(BaseModel):
-    question_code: Optional[str]
-    question_texte: Optional[str]
-    fini: bool
-    diagnostic_provisoire: Optional[str]
-    confiance: float
-
-# --- FONCTIONS UTILITAIRES ---
 def construire_vecteur(symptomes_dict: Dict[str, int]) -> tuple:
     X = np.zeros(len(symptom_list), dtype=np.int8)
     compte = 0
@@ -190,8 +193,6 @@ def calculer_niveau_confiance(proba: float) -> str:
     elif proba > 0.50: return "🟡 Possiblement"
     else: return "🔵 À confirmer avec médecin"
 
-# ========== ENDPOINTS ==========
-
 @app.get("/", tags=["Root"])
 async def root():
     return {"app": "Chatbot Diagnostic Médical DDXPlus", "status": "running"}
@@ -204,92 +205,8 @@ async def sante():
         maladies=len(pathologies),
         symptomes=len(symptom_list),
         accuracy="~95%",
-        version="3.1.0",
+        version="3.0.0",
         environment=ENVIRONMENT
-    )
-
-# --- NOUVEL ENDPOINT LOGIQUE DYNAMIQUE ---
-@app.post("/api/prochaine-question", response_model=NextQuestionResponse, tags=["Diagnostic"])
-async def prochaine_question(request: RequeteDiagnostic):
-    """
-    Détermine la meilleure question à poser basée sur les réponses précédentes.
-    """
-    if not rf_model:
-        raise HTTPException(status_code=503, detail="Modèle non chargé")
-    
-    symptomes_repondus = request.symptomes # Dict {code: 0 ou 1}
-    
-    # 1. Construire vecteur actuel
-    X, compte = construire_vecteur(symptomes_repondus)
-    
-    # 2. Obtenir probabilités actuelles
-    probas = rf_model.predict_proba([X])[0]
-    confiance_max = float(np.max(probas))
-    idx_top = np.argmax(probas)
-    maladie_provisoire = get_maladie_fr(idx_top)
-    
-    # CRITÈRE D'ARRÊT
-    # Si confiance > 85% OU plus de 15 questions posées (15 symptomes positifs trouvés ou total reponses)
-    if confiance_max > 0.85 or len(symptomes_repondus) >= 15:
-        return NextQuestionResponse(
-            question_code=None,
-            question_texte=None,
-            fini=True,
-            diagnostic_provisoire=maladie_provisoire,
-            confiance=confiance_max
-        )
-
-    # 3. STRATÉGIE ARBRE DE DÉCISION (Simplifiée et Rapide)
-    # On regarde les 5 maladies les plus probables
-    top_indices = np.argsort(probas)[-5:] 
-    
-    # On cherche le symptôme qui discrimine le mieux ces maladies
-    # (Celui qui apparait souvent dans ces maladies mais qu'on n'a pas encore posé)
-    
-    meilleur_code = None
-    
-    # Liste des codes déjà demandés
-    codes_deja_demandes = list(symptomes_repondus.keys())
-    
-    # On parcourt tous les symptômes possibles
-    # (Note: Pour optimiser, on pourrait pré-calculer une matrice Maladie-Symptome)
-    
-    # Pour faire simple et efficace sans matrice externe :
-    # On utilise l'importance des features du modèle si disponible, 
-    # ou on itère sur les symptômes non posés par ordre d'importance globale (approximatif)
-    
-    # Méthode simple : On prend les symptômes globaux les plus fréquents NON ENCORE POSÉS
-    # Idéalement, il faudrait la matrice de corrélation, mais ici on va utiliser 
-    # l'ordre de la symptom_list qui est souvent triée par fréquence dans DDXPlus
-    
-    # Amélioration : On utilise l'ordre d'importance des features du Random Forest
-    importances = rf_model.feature_importances_
-    indices_importants = np.argsort(importances)[::-1] # Du plus important au moins important
-    
-    for idx in indices_importants:
-        code_candidat = symptom_list[idx]
-        
-        # Si on ne l'a pas encore demandé
-        if code_candidat not in codes_deja_demandes:
-            meilleur_code = code_candidat
-            break # On a trouvé le prochain plus important
-            
-    # Si on ne trouve rien (cas rare), on prend le premier non répondu
-    if not meilleur_code:
-        for s in symptom_list:
-            if s not in codes_deja_demandes:
-                meilleur_code = s
-                break
-    
-    # Traduire la question
-    question_texte = SYMPTOMES_FR.get(meilleur_code, meilleur_code)
-    
-    return NextQuestionResponse(
-        question_code=meilleur_code,
-        question_texte=question_texte,
-        fini=False,
-        diagnostic_provisoire=maladie_provisoire,
-        confiance=confiance_max
     )
 
 @app.post("/api/diagnostic", response_model=ReponseDiagnostic, tags=["Diagnostic"])
